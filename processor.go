@@ -6,26 +6,27 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.opentelemetry.io/collector/processor/processorhelper"
 )
 
-var _ component.TracesProcessor = (*filterSpan)(nil)
-
-type filterSpan struct {
-	next consumer.Traces
+type filterspan struct {
+	StartTimeOffset uint64
+	nextConsumer    consumer.Traces
 }
 
-func (f *filterSpan) ConsumeTraces(ctx context.Context, batch ptrace.Traces) error {
-	return nil
+func newFilterSpanProcessor(nextConsumer consumer.Traces, cfg *Config) (component.TracesProcessor, error) {
+	fsp := filterspan{
+		StartTimeOffset: cfg.StartTimeOffset,
+		nextConsumer:    nextConsumer,
+	}
+	return processorhelper.NewTracesProcessor(
+		cfg,
+		nextConsumer,
+		fsp.ProcessTraces,
+		processorhelper.WithCapabilities(consumer.Capabilities{MutatesData: true}),
+	)
 }
 
-func (f *filterSpan) Capabilities() consumer.Capabilities {
-	return consumer.Capabilities{MutatesData: true}
-}
-
-func (f *filterSpan) Start(_ context.Context, host component.Host) error {
-	return nil
-}
-
-func (f *filterSpan) Shutdown(context.Context) error {
-	return nil
+func (fsp *filterspan) ProcessTraces(_ context.Context, batch ptrace.Traces) (ptrace.Traces, error) {
+	return batch, nil
 }

@@ -12,12 +12,10 @@ import (
 
 func TestLoadConfig(t *testing.T) {
 	factories, err := componenttest.NopFactories()
-
 	assert.NoError(t, err)
 
-	factories.Receivers["examplereceiver"] = componenttest.NewNopReceiverFactory()
-	factories.Exporters["exampleexporter"] = componenttest.NewNopExporterFactory()
-	factories.Processors[typeStr] = NewFactory()
+	factory := NewFactory()
+	factories.Processors[typeStr] = factory
 
 	cfg, err := servicetest.LoadConfigAndValidate(path.Join(".", "testdata", "config.yaml"), factories)
 

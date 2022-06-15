@@ -1,18 +1,19 @@
 receivers:
-  examplereceiver:
+  nop:
 
 processors:
-  filterspan:
+  filter_span:
+    start_time_offset: 3600000000000
 
 exporters:
-  exampleexporter:
+  nop:
 
 service:
   pipelines:
     traces:
       receivers:
-        - examplereceiver
+        - nop
       processors:
-        - filterspan
+        - filter_span
       exporters:
-        - exampleexporter
+        - nop
