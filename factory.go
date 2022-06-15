@@ -2,8 +2,7 @@ package filterspanprocessor
 
 import (
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config/configmodels"
-	"go.opentelemetry.io/collector/processor/processorhelper"
+	"go.opentelemetry.io/collector/config"
 )
 
 const (
@@ -11,17 +10,14 @@ const (
 )
 
 func NewFactory() component.ProcessorFactory {
-	return processorhelper.NewFactory(
+	return component.NewProcessorFactory(
 		typeStr,
 		createDefaultConfig,
 	)
 }
 
-func createDefaultConfig() configmodels.Processor {
+func createDefaultConfig() config.Processor {
 	return &Config{
-		ProcessorSettings: configmodels.ProcessorSettings{
-			TypeVal: typeStr,
-			NameVal: typeStr,
-		},
+		ProcessorSettings: config.NewProcessorSettings(config.NewComponentIDWithName(typeStr, typeStr)),
 	}
 }

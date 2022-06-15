@@ -1,7 +1,9 @@
 package filterspanprocessor
 
-import "go.opentelemetry.io/collector/config/configmodels"
+import (
+	"go.opentelemetry.io/collector/config"
+)
 
 type Config struct {
-	configmodels.ProcessorSettings `mapstructure:",squash"`
+	config.ProcessorSettings `mapstructure:",squash"`
 }

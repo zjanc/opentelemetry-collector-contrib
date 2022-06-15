@@ -8,9 +8,11 @@ import (
 	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
-func TestFilterByStarttime(t *testing.T) {
+func TestOne(t *testing.T) {
+	ptrace.NewTraces()
 	traces := ptrace.NewTraces()
 	rs := traces.ResourceSpans().AppendEmpty()
+	rs.ScopeSpans().AppendEmpty()
 	ss := rs.ScopeSpans().AppendEmpty()
 
 	currentSpan := ss.Spans().AppendEmpty()
