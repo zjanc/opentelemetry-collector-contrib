@@ -52,7 +52,7 @@ func TestNewTracesExporter(t *testing.T) {
 	} {
 		t.Run(tt.desc, func(t *testing.T) {
 			// test
-			_, err := newTracesExporter(exportertest.NewNopCreateSettings(), tt.config)
+			_, err := newTracesExporter(exportertest.NewNopCreateSettings(), tt.config, zap.NewNop())
 
 			// verify
 			require.Equal(t, tt.err, err)
@@ -69,7 +69,7 @@ func TestTracesExporterStart(t *testing.T) {
 		{
 			"ok",
 			func() *traceExporterImp {
-				p, _ := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig())
+				p, _ := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig(), zap.NewNop())
 				return p
 			}(),
 			nil,
@@ -78,7 +78,7 @@ func TestTracesExporterStart(t *testing.T) {
 			"error",
 			func() *traceExporterImp {
 				lb, _ := newLoadBalancer(exportertest.NewNopCreateSettings(), simpleConfig(), nil)
-				p, _ := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig())
+				p, _ := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig(), zap.NewNop())
 
 				lb.res = &mockResolver{
 					onStart: func(context.Context) error {
@@ -108,7 +108,7 @@ func TestTracesExporterStart(t *testing.T) {
 }
 
 func TestTracesExporterShutdown(t *testing.T) {
-	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig())
+	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig(), zap.NewNop())
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
@@ -127,11 +127,9 @@ func TestConsumeTraces(t *testing.T) {
 	require.NotNil(t, lb)
 	require.NoError(t, err)
 
-	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig())
+	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig(), zap.NewNop())
 	require.NotNil(t, p)
 	require.NoError(t, err)
-	assert.Equal(t, p.routingKey, traceIDRouting)
-
 	// pre-load an exporter here, so that we don't use the actual OTLP exporter
 	lb.addMissingExporters(context.Background(), []string{"endpoint-1"})
 	lb.res = &mockResolver{
@@ -163,10 +161,10 @@ func TestConsumeTracesServiceBased(t *testing.T) {
 	require.NotNil(t, lb)
 	require.NoError(t, err)
 
-	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), serviceBasedRoutingConfig())
+	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), serviceBasedRoutingConfig(), zap.NewNop())
 	require.NotNil(t, p)
 	require.NoError(t, err)
-	assert.Equal(t, p.routingKey, svcRouting)
+	assert.Equal(t, p.resourceKeys, []string{"service.name"})
 
 	// pre-load an exporter here, so that we don't use the actual OTLP exporter
 	lb.addMissingExporters(context.Background(), []string{"endpoint-1"})
@@ -192,32 +190,165 @@ func TestConsumeTracesServiceBased(t *testing.T) {
 }
 
 func TestServiceBasedRoutingForSameTraceId(t *testing.T) {
-	b := pcommon.TraceID([16]byte{1, 2, 3, 4})
 	for _, tt := range []struct {
-		desc       string
-		batch      ptrace.Traces
-		routingKey routingKey
-		res        map[string]bool
+		desc  string
+		batch ptrace.Traces
+		res   map[routingKey][]routingEntry
+		err   error
 	}{
 		{
 			"same trace id and different services - service based routing",
 			twoServicesWithSameTraceID(),
-			svcRouting,
-			map[string]bool{"ad-service-1": true, "get-recommendations-7": true},
-		},
-		{
-			"same trace id and different services - trace id routing",
-			twoServicesWithSameTraceID(),
-			traceIDRouting,
-			map[string]bool{string(b[:]): true},
+			map[routingKey][]routingEntry{
+				resourceAttrRouting: {
+
+					{
+						routingKey: resourceAttrRouting,
+						keyValue:   "ad-service-1",
+					},
+					{
+						routingKey: resourceAttrRouting,
+						keyValue:   "get-recommendations-7",
+					},
+				},
+			},
+			nil,
 		},
 	} {
 		t.Run(tt.desc, func(t *testing.T) {
-			res, err := routingIdentifiersFromTraces(tt.batch, tt.routingKey)
-			assert.Equal(t, err, nil)
-			assert.Equal(t, res, tt.res)
+			res, err := splitTracesByResourceAttr(tt.batch, []string{"service.name"})
+			for i, r := range res[resourceAttrRouting] {
+				assert.Equal(t, tt.res[resourceAttrRouting][i].routingKey, r.routingKey)
+				assert.Equal(t, tt.res[resourceAttrRouting][i].keyValue, r.keyValue)
+
+				var sn string
+				if v, ok := r.trace.ResourceSpans().At(0).Resource().Attributes().Get("service.name"); ok {
+					sn = v.Str()
+				} else {
+					sn = ""
+				}
+				assert.Equal(t, tt.res[resourceAttrRouting][i].keyValue, sn)
+			}
+			assert.Equal(t, tt.err, err)
 		})
 	}
+}
+
+func TestIdBasedRoutingForSameTraceId(t *testing.T) {
+	for _, tt := range []struct {
+		desc  string
+		batch ptrace.Traces
+		res   string
+		err   error
+	}{
+		{
+			"same trace id and different services - trace id routing",
+			twoServicesWithSameTraceID(),
+			"",
+			errors.New("routeByTraceId must receive a ptrace.Traces with a single ResourceSpan"),
+		},
+	} {
+		t.Run(tt.desc, func(t *testing.T) {
+			res, err := routeByTraceId(tt.batch)
+			assert.Equal(t, tt.err, err)
+			assert.Equal(t, tt.res, res)
+		})
+	}
+}
+
+func TestIdBasedRouting(t *testing.T) {
+	sink := new(consumertest.TracesSink)
+	componentFactory := func(ctx context.Context, endpoint string) (component.Component, error) {
+		return newMockTracesExporter(sink.ConsumeTraces), nil
+	}
+	lb, err := newLoadBalancer(exportertest.NewNopCreateSettings(), simpleConfig(), componentFactory)
+	require.NotNil(t, lb)
+	require.NoError(t, err)
+
+	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig(), zap.NewNop())
+	require.NoError(t, err)
+	require.NotNil(t, p)
+
+	// pre-load an exporter here, so that we don't use the actual OTLP exporter
+	lb.addMissingExporters(context.Background(), []string{"endpoint-1"})
+	lb.addMissingExporters(context.Background(), []string{"endpoint-2"})
+	lb.res = &mockResolver{
+		triggerCallbacks: true,
+		onResolve: func(ctx context.Context) ([]string, error) {
+			return []string{"endpoint-1", "endpoint-2"}, nil
+		},
+	}
+	p.loadBalancer = lb
+
+	err = p.Start(context.Background(), componenttest.NewNopHost())
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, p.Shutdown(context.Background()))
+	}()
+
+	// test
+	trace := twoServicesWithSameTraceID()
+	res := p.ConsumeTraces(context.Background(), trace)
+
+	// verify
+	assert.Nil(t, res)
+	assert.Len(t, sink.AllTraces(), 1)
+
+	sink.Reset()
+	appendSimpleTraceWithID(trace.ResourceSpans().At(0), [16]byte{5, 6, 7, 8})
+	appendSimpleTraceWithID(trace.ResourceSpans().At(0), [16]byte{6, 7, 8, 9})
+	appendSimpleTraceWithID(trace.ResourceSpans().At(0), [16]byte{7, 8, 9, 0})
+	res2 := p.ConsumeTraces(context.Background(), trace)
+
+	// verify
+	assert.Nil(t, res2)
+	assert.Len(t, sink.AllTraces(), 2)
+}
+
+func TestAttrBasedRouting(t *testing.T) {
+	sink := new(consumertest.TracesSink)
+	componentFactory := func(ctx context.Context, endpoint string) (component.Component, error) {
+		return newMockTracesExporter(sink.ConsumeTraces), nil
+	}
+	lb, err := newLoadBalancer(exportertest.NewNopCreateSettings(), attrBasedRoutingConfig(), componentFactory)
+	require.NotNil(t, lb)
+	require.NoError(t, err)
+
+	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), attrBasedRoutingConfig(), zap.NewNop())
+	require.NoError(t, err)
+	require.NotNil(t, p)
+	assert.Equal(t, p.resourceKeys, []string{"service.name"})
+
+	// pre-load an exporter here, so that we don't use the actual OTLP exporter
+	lb.addMissingExporters(context.Background(), []string{"endpoint-1"})
+	lb.addMissingExporters(context.Background(), []string{"endpoint-2"})
+	lb.res = &mockResolver{
+		triggerCallbacks: true,
+		onResolve: func(ctx context.Context) ([]string, error) {
+			return []string{"endpoint-1", "endpoint-2"}, nil
+		},
+	}
+	p.loadBalancer = lb
+
+	err = p.Start(context.Background(), componenttest.NewNopHost())
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, p.Shutdown(context.Background()))
+	}()
+
+	// test
+	trace := twoServicesWithSameTraceID()
+	rs := trace.ResourceSpans().AppendEmpty()
+	rs.Resource().Attributes().PutStr(conventions.AttributeServiceName, "ad-service-12345678")
+	appendSimpleTraceWithID(rs, [16]byte{1, 2, 3, 4})
+	res := p.ConsumeTraces(context.Background(), trace)
+
+	// verify
+	assert.Nil(t, res)
+
+	// Verify that the single Trace was split into two based on service name
+	// With the two `ad-service-1` RS being grouped into a single trace
+	assert.Len(t, sink.AllTraces(), 2)
 }
 
 func TestConsumeTracesExporterNoEndpoint(t *testing.T) {
@@ -228,7 +359,7 @@ func TestConsumeTracesExporterNoEndpoint(t *testing.T) {
 	require.NotNil(t, lb)
 	require.NoError(t, err)
 
-	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig())
+	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig(), zap.NewNop())
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
@@ -262,7 +393,7 @@ func TestConsumeTracesUnexpectedExporterType(t *testing.T) {
 	require.NotNil(t, lb)
 	require.NoError(t, err)
 
-	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig())
+	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig(), zap.NewNop())
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
@@ -327,7 +458,7 @@ func TestBatchWithTwoTraces(t *testing.T) {
 	require.NotNil(t, lb)
 	require.NoError(t, err)
 
-	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig())
+	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), simpleConfig(), zap.NewNop())
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
@@ -345,20 +476,19 @@ func TestBatchWithTwoTraces(t *testing.T) {
 
 	// verify
 	assert.NoError(t, err)
-	assert.Len(t, sink.AllTraces(), 2)
+	assert.Len(t, sink.AllTraces(), 1)
 }
 
-func TestNoTracesInBatch(t *testing.T) {
+func TestNoTracesInBatchTraceIdRouting(t *testing.T) {
 	for _, tt := range []struct {
-		desc       string
-		batch      ptrace.Traces
-		routingKey routingKey
-		err        error
+		desc  string
+		batch ptrace.Traces
+		err   error
 	}{
+		// Trace ID routing
 		{
 			"no resource spans",
 			ptrace.NewTraces(),
-			traceIDRouting,
 			errors.New("empty resource spans"),
 		},
 		{
@@ -368,9 +498,25 @@ func TestNoTracesInBatch(t *testing.T) {
 				batch.ResourceSpans().AppendEmpty()
 				return batch
 			}(),
-			traceIDRouting,
 			errors.New("empty scope spans"),
 		},
+	} {
+		t.Run(tt.desc, func(t *testing.T) {
+			res, err := routeByTraceId(tt.batch)
+			assert.Equal(t, err, tt.err)
+			assert.Equal(t, res, "")
+		})
+	}
+}
+
+func TestNoTracesInBatchResourceRouting(t *testing.T) {
+	for _, tt := range []struct {
+		desc  string
+		batch ptrace.Traces
+		res   []routingEntry
+		err   error
+	}{
+		// Service / Resource Attribute routing
 		{
 			"no spans",
 			func() ptrace.Traces {
@@ -378,14 +524,22 @@ func TestNoTracesInBatch(t *testing.T) {
 				batch.ResourceSpans().AppendEmpty().ScopeSpans().AppendEmpty()
 				return batch
 			}(),
-			svcRouting,
-			errors.New("empty spans"),
+			[]routingEntry{
+				{
+					routingKey: traceIDRouting,
+					keyValue:   "",
+				},
+			},
+			nil,
 		},
 	} {
 		t.Run(tt.desc, func(t *testing.T) {
-			res, err := routingIdentifiersFromTraces(tt.batch, tt.routingKey)
-			assert.Equal(t, err, tt.err)
-			assert.Equal(t, res, map[string]bool(nil))
+			res, err := splitTracesByResourceAttr(tt.batch, []string{"service.name"})
+			assert.Equal(t, tt.err, err)
+			for i, res := range res[resourceAttrRouting] {
+				assert.Equal(t, tt.res[i].routingKey, res.routingKey)
+				assert.Equal(t, tt.res[i].keyValue, res.keyValue)
+			}
 		})
 	}
 }
@@ -454,7 +608,7 @@ func TestRollingUpdatesWhenConsumeTraces(t *testing.T) {
 	require.NotNil(t, lb)
 	require.NoError(t, err)
 
-	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), cfg)
+	p, err := newTracesExporter(exportertest.NewNopCreateSettings(), cfg, zap.NewNop())
 	require.NotNil(t, p)
 	require.NoError(t, err)
 
@@ -587,6 +741,16 @@ func serviceBasedRoutingConfig() *Config {
 			Static: &StaticResolver{Hostnames: []string{"endpoint-1"}},
 		},
 		RoutingKey: "service",
+	}
+}
+
+func attrBasedRoutingConfig() *Config {
+	return &Config{
+		Resolver: ResolverSettings{
+			Static: &StaticResolver{Hostnames: []string{"endpoint-1", "endpoint-2", "endpoint-3"}},
+		},
+		RoutingKey:   "resource",
+		ResourceKeys: []string{"service.name"},
 	}
 }
 
