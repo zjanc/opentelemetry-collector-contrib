@@ -111,12 +111,21 @@ func (e *traceExporterImp) consumeTracesById(ctx context.Context, td ptrace.Trac
 	var errs error
 	batches := batchpersignal.SplitTraces(td)
 
+	var re []routingEntry
 	for _, t := range batches {
+		// We convert this batch into a list of routeEntries
+		// so it can be batched by batchByEndpoint
 		if tid, err := routeByTraceId(t); err == nil {
-			errs = multierr.Append(errs, e.consumeTrace(ctx, t, tid))
+			re = append(re, routingEntry{
+				routingKey: traceIDRouting,
+				keyValue:   tid,
+			})
 		} else {
 			return err
 		}
+	}
+	for _, b := range e.batchByEndpoint(re) {
+		errs = multierr.Append(errs, e.consumeTrace(ctx, b.trace, b.keyValue))
 	}
 	return errs
 }
@@ -127,16 +136,44 @@ func (e *traceExporterImp) consumeTracesByResource(ctx context.Context, td ptrac
 	if err != nil {
 		return err
 	}
-	for _, batch := range routeBatches {
-		switch batch.routingKey {
+	for routing, batches := range routeBatches {
+		switch routing {
 		case resourceAttrRouting:
-			errs = multierr.Append(errs, e.consumeTrace(ctx, batch.trace, batch.keyValue))
+			for _, b := range e.batchByEndpoint(batches) {
+				errs = multierr.Append(errs, e.consumeTrace(ctx, b.trace, b.keyValue))
+			}
 		case traceIDRouting:
-			errs = multierr.Append(errs, e.consumeTracesById(ctx, batch.trace))
+			// Batch together these traces and reingest them via the trace id load balancing pipeline
+			t := ptrace.NewTraces()
+			for _, b := range batches {
+				b.trace.ResourceSpans().MoveAndAppendTo(t.ResourceSpans())
+			}
+			errs = multierr.Append(errs, e.consumeTracesById(ctx, t))
 		}
 	}
 	return errs
+}
 
+func (e *traceExporterImp) batchByEndpoint(re []routingEntry) []routingEntry {
+	traceMap := make(map[string]routingEntry)
+	for _, entry := range re {
+		endpoint := e.loadBalancer.Endpoint([]byte(entry.keyValue))
+		if _, ok := traceMap[endpoint]; !ok {
+			traceMap[endpoint] = routingEntry{
+				routingKey: entry.routingKey,
+				// We only need to store one keyValue since we expect all keyValues
+				// grouped here to hash to the same endpoint
+				keyValue: entry.keyValue,
+				trace:    ptrace.NewTraces(),
+			}
+		}
+		entry.trace.ResourceSpans().MoveAndAppendTo(traceMap[endpoint].trace.ResourceSpans())
+	}
+	var res []routingEntry
+	for _, tm := range traceMap {
+		res = append(res, tm)
+	}
+	return res
 }
 
 func (e *traceExporterImp) consumeTrace(ctx context.Context, td ptrace.Traces, rid string) error {
@@ -187,12 +224,17 @@ func getResourceAttrValue(rs ptrace.ResourceSpans, resourceKeys []string) (strin
 	return res, found
 }
 
-func splitTracesByResourceAttr(batches ptrace.Traces, resourceKeys []string) ([]routingEntry, error) {
+func splitTracesByResourceAttr(batches ptrace.Traces, resourceKeys []string) (map[routingKey][]routingEntry, error) {
 	// This function batches all the ResourceSpans with the same routing resource attribute value into a single ptrace.Trace
-	// This returns a list of routing entries which consists of the routing key, routing key value and the trace
+	// This returns a map which contains list of routing entries containing the routing key, routing key value and the trace
 	// There should be a 1:1 mapping between key value <-> trace
 	// This is because we group all Resource Spans with the same key value under a single trace
-	var result []routingEntry
+	// We place the routingEntry lists inside a map so we don't have to loop through the list again
+	// and regroup by routingKey when we do the batching
+	var result = make(map[routingKey][]routingEntry)
+	result[traceIDRouting] = []routingEntry{}
+	result[resourceAttrRouting] = []routingEntry{}
+
 	rss := batches.ResourceSpans()
 
 	// This is a mapping between the resource attribute values found and the constructed trace
@@ -214,7 +256,7 @@ func splitTracesByResourceAttr(batches ptrace.Traces, resourceKeys []string) ([]
 			rs.CopyTo(t.ResourceSpans().AppendEmpty())
 			// We can't route this whole Resource Span by a single trace ID
 			// because it's possible for the spans under the RS to have different trace IDs
-			result = append(result, routingEntry{
+			result[traceIDRouting] = append(result[traceIDRouting], routingEntry{
 				routingKey: traceIDRouting,
 				trace:      t,
 			})
@@ -222,8 +264,9 @@ func splitTracesByResourceAttr(batches ptrace.Traces, resourceKeys []string) ([]
 	}
 
 	// We convert the attr value:trace mapping into a list of routingEntries
+	// Only traces that will be resource attribute balanced end up in routeMap
 	for key, trace := range routeMap {
-		result = append(result, routingEntry{
+		result[resourceAttrRouting] = append(result[resourceAttrRouting], routingEntry{
 			routingKey: resourceAttrRouting,
 			keyValue:   key,
 			trace:      trace,
