@@ -202,20 +202,23 @@ func TestServiceBasedRoutingForSameTraceId(t *testing.T) {
 	for _, tt := range []struct {
 		desc  string
 		batch ptrace.Traces
-		res   []routingEntry
+		res   map[routingKey][]routingEntry
 		err   error
 	}{
 		{
 			"same trace id and different services - service based routing",
 			twoServicesWithSameTraceID(),
-			[]routingEntry{
-				{
-					routingKey: resourceAttrRouting,
-					keyValue:   "ad-service-1",
-				},
-				{
-					routingKey: resourceAttrRouting,
-					keyValue:   "get-recommendations-7",
+			map[routingKey][]routingEntry{
+				resourceAttrRouting: {
+
+					{
+						routingKey: resourceAttrRouting,
+						keyValue:   "ad-service-1",
+					},
+					{
+						routingKey: resourceAttrRouting,
+						keyValue:   "get-recommendations-7",
+					},
 				},
 			},
 			nil,
@@ -223,9 +226,9 @@ func TestServiceBasedRoutingForSameTraceId(t *testing.T) {
 	} {
 		t.Run(tt.desc, func(t *testing.T) {
 			res, err := splitTracesByResourceAttr(tt.batch, []string{"service.name"})
-			for i, r := range res {
-				assert.Equal(t, tt.res[i].routingKey, r.routingKey)
-				assert.Equal(t, tt.res[i].keyValue, r.keyValue)
+			for i, r := range res[resourceAttrRouting] {
+				assert.Equal(t, tt.res[resourceAttrRouting][i].routingKey, r.routingKey)
+				assert.Equal(t, tt.res[resourceAttrRouting][i].keyValue, r.keyValue)
 
 				var sn string
 				if v, ok := r.trace.ResourceSpans().At(0).Resource().Attributes().Get("service.name"); ok {
@@ -233,7 +236,7 @@ func TestServiceBasedRoutingForSameTraceId(t *testing.T) {
 				} else {
 					sn = ""
 				}
-				assert.Equal(t, tt.res[i].keyValue, sn)
+				assert.Equal(t, tt.res[resourceAttrRouting][i].keyValue, sn)
 			}
 			assert.Equal(t, tt.err, err)
 		})
@@ -278,11 +281,10 @@ func TestIdBasedRouting(t *testing.T) {
 	// pre-load an exporter here, so that we don't use the actual OTLP exporter
 	lb.addMissingExporters(context.Background(), []string{"endpoint-1"})
 	lb.addMissingExporters(context.Background(), []string{"endpoint-2"})
-	lb.addMissingExporters(context.Background(), []string{"endpoint-3"})
 	lb.res = &mockResolver{
 		triggerCallbacks: true,
 		onResolve: func(ctx context.Context) ([]string, error) {
-			return []string{"endpoint-1", "endpoint-2", "endpoint-3"}, nil
+			return []string{"endpoint-1", "endpoint-2"}, nil
 		},
 	}
 	p.loadBalancer = lb
@@ -295,58 +297,21 @@ func TestIdBasedRouting(t *testing.T) {
 
 	// test
 	trace := twoServicesWithSameTraceID()
-	appendSimpleTraceWithID(trace.ResourceSpans().At(0), [16]byte{1, 2, 3, 4})
-	trace.ResourceSpans().At(0).ScopeSpans().At(0).Spans().AppendEmpty().SetTraceID([16]byte{1, 2, 3, 4})
-	trace.ResourceSpans().At(0).ScopeSpans().At(0).Spans().AppendEmpty().SetTraceID([16]byte{2, 3, 4, 5})
 	res := p.ConsumeTraces(context.Background(), trace)
-
-	// Resulting Trace
-	// {
-	// 	ptrace.Traces: [
-	// 		{
-	// 			ResourceSpans: [{
-	// 				service.name: "ad-service-1"
-	// 				ScopeSpans: [{
-	// 					Spans: [{
-	// 						TraceID: "1234"
-	// 					}]
-	// 					Spans: [{
-	// 						TraceID: "1234"
-	// 					}]
-	// 					Spans: [{
-	// 						TraceID: "2345"
-	// 					}]
-	// 				}]
-	// 				ScopeSpans: [{
-	// 					Spans: [{
-	// 						TraceID: "1234"
-	// 					}]
-	// 				}]
-	// 			}]
-	// 		},
-	// 		{
-	// 			ResourceSpans: [{
-	// 				service.name: "get-recommendation-7"
-	// 				ScopeSpans: [{
-	// 					Spans: [{
-	// 						TraceID: "1234"
-	// 					}]
-	// 				}]
-	// 			}]
-	// 		}
-	// 	]
-	// }
 
 	// verify
 	assert.Nil(t, res)
+	assert.Len(t, sink.AllTraces(), 1)
 
-	// This will be split into four because of the behavior of batchpersignal.SplitTraces
-	// The ad-service-1 trace is split into 3
-	// - 1 trace containing the two "1234" spans
-	// - 1 trace containing the "2345" span
-	// - 1 trace containing the span in a different ILS (despite having the same trace ID as the two "1234" spans)
-	// - 1 trace containing the span in a different RS (despite having the same trace ID as the thre "1234" spans)
-	assert.Len(t, sink.AllTraces(), 4)
+	sink.Reset()
+	appendSimpleTraceWithID(trace.ResourceSpans().At(0), [16]byte{5, 6, 7, 8})
+	appendSimpleTraceWithID(trace.ResourceSpans().At(0), [16]byte{6, 7, 8, 9})
+	appendSimpleTraceWithID(trace.ResourceSpans().At(0), [16]byte{7, 8, 9, 0})
+	res2 := p.ConsumeTraces(context.Background(), trace)
+
+	// verify
+	assert.Nil(t, res2)
+	assert.Len(t, sink.AllTraces(), 2)
 }
 
 func TestAttrBasedRouting(t *testing.T) {
@@ -366,11 +331,10 @@ func TestAttrBasedRouting(t *testing.T) {
 	// pre-load an exporter here, so that we don't use the actual OTLP exporter
 	lb.addMissingExporters(context.Background(), []string{"endpoint-1"})
 	lb.addMissingExporters(context.Background(), []string{"endpoint-2"})
-	lb.addMissingExporters(context.Background(), []string{"endpoint-3"})
 	lb.res = &mockResolver{
 		triggerCallbacks: true,
 		onResolve: func(ctx context.Context) ([]string, error) {
-			return []string{"endpoint-1", "endpoint-2", "endpoint-3"}, nil
+			return []string{"endpoint-1", "endpoint-2"}, nil
 		},
 	}
 	p.loadBalancer = lb
@@ -384,7 +348,7 @@ func TestAttrBasedRouting(t *testing.T) {
 	// test
 	trace := twoServicesWithSameTraceID()
 	rs := trace.ResourceSpans().AppendEmpty()
-	rs.Resource().Attributes().PutStr(conventions.AttributeServiceName, "ad-service-1")
+	rs.Resource().Attributes().PutStr(conventions.AttributeServiceName, "ad-service-12345678")
 	appendSimpleTraceWithID(rs, [16]byte{1, 2, 3, 4})
 	res := p.ConsumeTraces(context.Background(), trace)
 
@@ -521,7 +485,7 @@ func TestBatchWithTwoTraces(t *testing.T) {
 
 	// verify
 	assert.NoError(t, err)
-	assert.Len(t, sink.AllTraces(), 2)
+	assert.Len(t, sink.AllTraces(), 1)
 }
 
 func TestNoTracesInBatchTraceIdRouting(t *testing.T) {
@@ -581,9 +545,9 @@ func TestNoTracesInBatchResourceRouting(t *testing.T) {
 		t.Run(tt.desc, func(t *testing.T) {
 			res, err := splitTracesByResourceAttr(tt.batch, []string{"service.name"})
 			assert.Equal(t, tt.err, err)
-			for i, _ := range res {
-				assert.Equal(t, tt.res[i].routingKey, res[i].routingKey)
-				assert.Equal(t, tt.res[i].keyValue, res[i].keyValue)
+			for i, res := range res[resourceAttrRouting] {
+				assert.Equal(t, tt.res[i].routingKey, res.routingKey)
+				assert.Equal(t, tt.res[i].keyValue, res.keyValue)
 			}
 		})
 	}

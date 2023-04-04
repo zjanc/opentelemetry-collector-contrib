@@ -119,6 +119,7 @@ func (e *traceExporterImp) consumeTracesById(ctx context.Context, td ptrace.Trac
 			re = append(re, routingEntry{
 				routingKey: traceIDRouting,
 				keyValue:   tid,
+				trace:      t,
 			})
 		} else {
 			return err
@@ -271,6 +272,10 @@ func splitTracesByResourceAttr(batches ptrace.Traces, resourceKeys []string) (ma
 			keyValue:   key,
 			trace:      trace,
 		})
+	}
+
+	if len(result[traceIDRouting]) == 0 {
+		delete(result, traceIDRouting)
 	}
 
 	return result, nil
